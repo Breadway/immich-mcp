@@ -204,9 +204,10 @@ var tools = []toolDef{
 	},
 	{
 		Name:        "person_photos",
-		Description: "Photos and videos of one person: pass a person id from search_people or a full name. Returns one page of assets (id, filename, date, type, dimensions).",
+		Description: "Photos and videos of people: pass one person id/name or several via people for photos containing ALL of them. Returns one page of assets (id, filename, date, type, dimensions).",
 		InputSchema: objSchema(map[string]any{
-			"person": strProp("Person UUID or full name"),
+			"person": strProp("One person UUID or full name"),
+			"people": peopleProp(),
 			"size":   intProp("Results per page 1-100", 1, 100),
 			"page":   intProp("Page number from 1", 1, 1000000),
 		}, []string{"person"}),
@@ -223,7 +224,8 @@ var tools = []toolDef{
 		Name:        "photo_search",
 		Description: "Filtered library search: person id or name, date range, favorites flag, media type. Dates like 2026-10-01 (time optional). Returns projected asset rows with ids for show_photo.",
 		InputSchema: objSchema(map[string]any{
-			"person":      strProp("Person UUID or name. Omit for anyone."),
+			"person":      strProp("One person UUID or name. Omit for anyone."),
+			"people":      peopleProp(),
 			"takenAfter":  strProp("Only photos taken at or after this date, e.g. 2026-04-01"),
 			"takenBefore": strProp("Only photos taken before this date"),
 			"isFavorite":  boolProp("True for favorites only, false for non-favorites. Omit for both."),
@@ -547,8 +549,46 @@ func hSearchPeople(args map[string]any) map[string]any {
 	return okText(buf)
 }
 
+// resolvePeople gathers person ids from the "person" (single id or name)
+// and/or "people" (array of ids or names) arguments, deduplicated.
+func resolvePeople(args map[string]any) ([]string, []string, map[string]any) {
+	var refs []string
+	if ref := strings.TrimSpace(strArg(args, "person")); ref != "" {
+		refs = append(refs, ref)
+	}
+	refs = append(refs, toStringSlice(args["people"])...)
+	seen := map[string]bool{}
+	var ids, names []string
+	for _, ref := range refs {
+		if v := strings.TrimSpace(ref); v != "" && !seen[v] {
+			seen[v] = true
+			id, name, errMap := resolvePerson(v)
+			if errMap != nil {
+				return nil, nil, errMap
+			}
+			ids = append(ids, id)
+			if name == "" {
+				name = id
+			}
+			names = append(names, name)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil, errText("person or people is required")
+	}
+	return ids, names, nil
+}
+
+func peopleProp() map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"items":       map[string]any{"type": "string"},
+		"description": "Several person UUIDs or names for AND matching (photos containing ALL of them), e.g. [\"Mia\", \"Noah\"]",
+	}
+}
+
 func hPersonPhotos(args map[string]any) map[string]any {
-	id, name, errMap := resolvePerson(strArg(args, "person"))
+	ids, names, errMap := resolvePeople(args)
 	if errMap != nil {
 		return errMap
 	}
@@ -563,26 +603,80 @@ func hPersonPhotos(args map[string]any) map[string]any {
 	if page < 1 {
 		page = 1
 	}
-	status, body, err := apiPost("/api/search/metadata", map[string]any{"personIds": []string{id}, "size": size, "page": page})
+	status, body, err := apiPost("/api/search/metadata", map[string]any{"personIds": ids, "size": size, "page": page})
 	if err != nil {
 		return errText("photo search failed: %v", err)
 	}
 	if status >= 400 {
 		return errText("Immich HTTP %d: %s", status, clip(string(body)))
 	}
-	person := name
-	if person == "" {
-		person = id
-	}
 	projected := projectPersonAssets(body)
 	var wrap map[string]any
 	if err := json.Unmarshal(projected, &wrap); err != nil {
 		return okText(body)
 	}
-	wrap["person"] = person
+	wrap["persons"] = names
+	wrap["personIds"] = ids
 	wrap["page"] = page
 	buf, _ := json.Marshal(wrap)
 	return okText(buf)
+}
+
+func hPhotoSearch(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	payload := map[string]any{}
+	if hasPeople(args) {
+		ids, _, errMap := resolvePeople(args)
+		if errMap != nil {
+			return errMap
+		}
+		payload["personIds"] = ids
+	}
+	if v := normDateTime(strArg(args, "takenAfter")); v != "" {
+		payload["takenAfter"] = v
+	}
+	if v := normDateTime(strArg(args, "takenBefore")); v != "" {
+		payload["takenBefore"] = v
+	}
+	if _, present := args["isFavorite"]; present {
+		payload["isFavorite"] = boolArg(args, "isFavorite", false)
+	}
+	if v := strings.ToUpper(strings.TrimSpace(strArg(args, "type"))); v == "IMAGE" || v == "VIDEO" {
+		payload["type"] = v
+	}
+	size := intArg(args, "size", 20)
+	if size < 1 {
+		size = 1
+	}
+	if size > 100 {
+		size = 100
+	}
+	payload["size"] = size
+	if page := intArg(args, "page", 1); page > 1 {
+		payload["page"] = page
+	}
+	status, body, err := apiPost("/api/search/metadata", payload)
+	if err != nil {
+		return errText("photo search failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	return okText(projectPersonAssets(body))
+}
+
+func hasPeople(args map[string]any) bool {
+	if strings.TrimSpace(strArg(args, "person")) != "" {
+		return true
+	}
+	for _, raw := range toStringSlice(args["people"]) {
+		if strings.TrimSpace(raw) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func apiGetBytes(path string, query map[string]string) (int, string, []byte, error) {
@@ -688,51 +782,6 @@ func boolArg(args map[string]any, key string, def bool) bool {
 		return v
 	}
 	return def
-}
-
-func hPhotoSearch(args map[string]any) map[string]any {
-	if e := requireKey(); e != nil {
-		return e
-	}
-	payload := map[string]any{}
-	if ref := strings.TrimSpace(strArg(args, "person")); ref != "" {
-		id, _, errMap := resolvePerson(ref)
-		if errMap != nil {
-			return errMap
-		}
-		payload["personIds"] = []string{id}
-	}
-	if v := normDateTime(strArg(args, "takenAfter")); v != "" {
-		payload["takenAfter"] = v
-	}
-	if v := normDateTime(strArg(args, "takenBefore")); v != "" {
-		payload["takenBefore"] = v
-	}
-	if _, present := args["isFavorite"]; present {
-		payload["isFavorite"] = boolArg(args, "isFavorite", false)
-	}
-	if v := strings.ToUpper(strings.TrimSpace(strArg(args, "type"))); v == "IMAGE" || v == "VIDEO" {
-		payload["type"] = v
-	}
-	size := intArg(args, "size", 20)
-	if size < 1 {
-		size = 1
-	}
-	if size > 100 {
-		size = 100
-	}
-	payload["size"] = size
-	if page := intArg(args, "page", 1); page > 1 {
-		payload["page"] = page
-	}
-	status, body, err := apiPost("/api/search/metadata", payload)
-	if err != nil {
-		return errText("photo search failed: %v", err)
-	}
-	if status >= 400 {
-		return errText("Immich HTTP %d: %s", status, clip(string(body)))
-	}
-	return okText(projectPersonAssets(body))
 }
 
 func hRecentPhotos(args map[string]any) map[string]any {
