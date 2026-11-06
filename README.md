@@ -16,8 +16,12 @@ go build -o immich-mcp .
 
 ## Tools
 
-`search_photos`, `list_albums`, `album_assets`, `asset_info`, `server_stats`
-(admin key needed for stats).
+`search_photos`, `list_albums`, `album_assets`, `asset_info`,
+`search_people`, `person_photos`, `server_stats` (admin key needed for stats).
+
+`search_people` matches facial-recognition names (exact, then unique
+substring); `person_photos` takes a person id or full name plus `size`/`page`
+and returns projected asset rows.
 
 ## Hestia wiring
 

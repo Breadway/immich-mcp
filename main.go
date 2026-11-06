@@ -193,6 +193,22 @@ var tools = []toolDef{
 		}, []string{"assetId"}),
 	},
 	{
+		Name:        "search_people",
+		Description: "Find faces in the facial-recognition library by name. Returns each match with its person id, name and photo count. Use the id with person_photos.",
+		InputSchema: objSchema(map[string]any{
+			"query": strProp("Name or name fragment"),
+		}, []string{"query"}),
+	},
+	{
+		Name:        "person_photos",
+		Description: "Photos and videos of one person: pass a person id from search_people or a full name. Returns one page of assets (id, filename, date, type, dimensions).",
+		InputSchema: objSchema(map[string]any{
+			"person": strProp("Person UUID or full name"),
+			"size":   intProp("Results per page 1-100", 1, 100),
+			"page":   intProp("Page number from 1", 1, 1000000),
+		}, []string{"person"}),
+	},
+	{
 		Name:        "server_stats",
 		Description: "Library-wide usage statistics (photos, videos, storage by user). Requires an admin API key.",
 		InputSchema: objSchema(map[string]any{}, nil),
@@ -205,6 +221,8 @@ var handlers = map[string]handler{
 	"album_assets":  hAlbumAssets,
 	"asset_info":    hAssetInfo,
 	"server_stats":  hServerStats,
+	"search_people": hSearchPeople,
+	"person_photos": hPersonPhotos,
 }
 
 func strArg(args map[string]any, key string) string {
@@ -313,6 +331,188 @@ func hServerStats(_ map[string]any) map[string]any {
 		return errText("Immich HTTP %d: %s", status, clip(string(body)))
 	}
 	return okText(body)
+}
+
+type person struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func getPeople() ([]person, error) {
+	status, body, err := apiGet("/api/people", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return nil, fmt.Errorf("Immich HTTP %d: %s", status, firstChars(string(body), 200))
+	}
+	var envelope struct {
+		People []person `json:"people"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	return envelope.People, nil
+}
+
+func firstChars(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+func personAssetCount(id string) int {
+	status, body, err := apiGet("/api/people/"+url.PathEscape(id)+"/statistics", nil)
+	if err != nil || status >= 400 {
+		return -1
+	}
+	var st struct {
+		Assets int `json:"assets"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil {
+		return -1
+	}
+	return st.Assets
+}
+
+// resolvePerson accepts a UUID (verified live) or a name. Names match exact
+// case-insensitive first, then unique substring; ambiguous or missing names
+// return a descriptive error listing the candidates.
+func resolvePerson(ref string) (string, string, map[string]any) {
+	if e := requireKey(); e != nil {
+		return "", "", e
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", "", errText("person is required")
+	}
+	if status, body, err := apiGet("/api/people/"+url.PathEscape(ref), nil); err == nil && status < 400 {
+		var p person
+		if json.Unmarshal(body, &p) == nil && p.ID != "" {
+			return p.ID, p.Name, nil
+		}
+	}
+	people, err := getPeople()
+	if err != nil {
+		return "", "", errText("people lookup failed: %v", err)
+	}
+	lower := strings.ToLower(ref)
+	for _, p := range people {
+		if strings.ToLower(p.Name) == lower && p.Name != "" {
+			return p.ID, p.Name, nil
+		}
+	}
+	var matches []person
+	for _, p := range people {
+		if p.Name != "" && strings.Contains(strings.ToLower(p.Name), lower) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].ID, matches[0].Name, nil
+	}
+	if len(matches) == 0 {
+		return "", "", errText("no face named %q", ref)
+	}
+	names := make([]string, 0, len(matches))
+	for _, m := range matches {
+		names = append(names, m.Name+" ("+m.ID+")")
+	}
+	return "", "", errText("ambiguous name %q, candidates: %s", ref, strings.Join(names, "; "))
+}
+
+func projectPersonAssets(body []byte) []byte {
+	var envelope struct {
+		Assets struct {
+			Total int              `json:"total"`
+			Items []map[string]any `json:"items"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return body
+	}
+	keep := []string{"id", "originalFileName", "type", "localDateTime", "fileCreatedAt", "width", "height", "isFavorite", "duration"}
+	items := make([]map[string]any, 0, len(envelope.Assets.Items))
+	for _, it := range envelope.Assets.Items {
+		row := map[string]any{}
+		for _, k := range keep {
+			if v, present := it[k]; present {
+				row[k] = v
+			}
+		}
+		items = append(items, row)
+	}
+	compact, err := json.Marshal(map[string]any{"total": envelope.Assets.Total, "items": items})
+	if err != nil {
+		return body
+	}
+	return compact
+}
+
+func hSearchPeople(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	q := strings.ToLower(strings.TrimSpace(strArg(args, "query")))
+	if q == "" {
+		return errText("query is required")
+	}
+	people, err := getPeople()
+	if err != nil {
+		return errText("people lookup failed: %v", err)
+	}
+	type hit struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Photos int    `json:"photos"`
+	}
+	hits := []hit{}
+	for _, p := range people {
+		if p.Name != "" && strings.Contains(strings.ToLower(p.Name), q) {
+			hits = append(hits, hit{ID: p.ID, Name: p.Name, Photos: personAssetCount(p.ID)})
+		}
+	}
+	buf, _ := json.Marshal(map[string]any{"matches": hits})
+	return okText(buf)
+}
+
+func hPersonPhotos(args map[string]any) map[string]any {
+	id, name, errMap := resolvePerson(strArg(args, "person"))
+	if errMap != nil {
+		return errMap
+	}
+	size := intArg(args, "size", 20)
+	if size < 1 {
+		size = 1
+	}
+	if size > 100 {
+		size = 100
+	}
+	page := intArg(args, "page", 1)
+	if page < 1 {
+		page = 1
+	}
+	status, body, err := apiPost("/api/search/metadata", map[string]any{"personIds": []string{id}, "size": size, "page": page})
+	if err != nil {
+		return errText("photo search failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	person := name
+	if person == "" {
+		person = id
+	}
+	projected := projectPersonAssets(body)
+	var wrap map[string]any
+	if err := json.Unmarshal(projected, &wrap); err != nil {
+		return okText(body)
+	}
+	wrap["person"] = person
+	wrap["page"] = page
+	buf, _ := json.Marshal(wrap)
+	return okText(buf)
 }
 
 // ---------- schema helpers ----------
