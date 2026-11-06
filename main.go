@@ -11,6 +11,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -209,6 +210,14 @@ var tools = []toolDef{
 		}, []string{"person"}),
 	},
 	{
+		Name:        "show_photo",
+		Description: "Display one photo or video still to the user in chat: pass an asset id from person_photos, search_photos or album_assets. The image renders inline; prefer preview size, thumbnail for a small quick view.",
+		InputSchema: objSchema(map[string]any{
+			"assetId": strProp("Asset UUID"),
+			"size":    strProp("thumbnail or preview, default preview"),
+		}, []string{"assetId"}),
+	},
+	{
 		Name:        "server_stats",
 		Description: "Library-wide usage statistics (photos, videos, storage by user). Requires an admin API key.",
 		InputSchema: objSchema(map[string]any{}, nil),
@@ -221,6 +230,7 @@ var handlers = map[string]handler{
 	"album_assets":  hAlbumAssets,
 	"asset_info":    hAssetInfo,
 	"server_stats":  hServerStats,
+	"show_photo":    hShowPhoto,
 	"search_people": hSearchPeople,
 	"person_photos": hPersonPhotos,
 }
@@ -513,6 +523,67 @@ func hPersonPhotos(args map[string]any) map[string]any {
 	wrap["page"] = page
 	buf, _ := json.Marshal(wrap)
 	return okText(buf)
+}
+
+func apiGetBytes(path string, query map[string]string) (int, string, []byte, error) {
+	u, err := url.Parse(baseURL + path)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	if len(query) > 0 {
+		q := u.Query()
+		for k, v := range query {
+			q.Set(k, v)
+		}
+		u.RawQuery = q.Encode()
+	}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Accept", "image/*")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 6<<20))
+	if err != nil {
+		return resp.StatusCode, "", nil, err
+	}
+	return resp.StatusCode, resp.Header.Get("Content-Type"), body, nil
+}
+
+func hShowPhoto(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	id := strArg(args, "assetId")
+	if id == "" {
+		return errText("assetId is required")
+	}
+	size := strings.ToLower(strings.TrimSpace(strArg(args, "size")))
+	if size != "thumbnail" && size != "preview" {
+		size = "preview"
+	}
+	status, ctype, body, err := apiGetBytes("/api/assets/"+url.PathEscape(id)+"/thumbnail", map[string]string{"size": size})
+	if err != nil {
+		return errText("photo fetch failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, firstChars(string(body), 200))
+	}
+	if ctype == "" {
+		ctype = "image/jpeg"
+	}
+	if !strings.HasPrefix(ctype, "image/") {
+		return errText("unexpected content type %s", ctype)
+	}
+	return map[string]any{"content": []any{
+		map[string]any{"type": "text", "text": "Photo " + id + " (" + size + ", " + ctype + ", " + strconv.Itoa(len(body)) + " bytes)"},
+		map[string]any{"type": "image", "data": base64.StdEncoding.EncodeToString(body), "mimeType": ctype},
+	}}
 }
 
 // ---------- schema helpers ----------
