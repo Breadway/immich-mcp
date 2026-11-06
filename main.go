@@ -11,7 +11,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -218,6 +220,58 @@ var tools = []toolDef{
 		}, []string{"assetId"}),
 	},
 	{
+		Name:        "photo_search",
+		Description: "Filtered library search: person id or name, date range, favorites flag, media type. Dates like 2026-10-01 (time optional). Returns projected asset rows with ids for show_photo.",
+		InputSchema: objSchema(map[string]any{
+			"person":      strProp("Person UUID or name. Omit for anyone."),
+			"takenAfter":  strProp("Only photos taken at or after this date, e.g. 2026-04-01"),
+			"takenBefore": strProp("Only photos taken before this date"),
+			"isFavorite":  boolProp("True for favorites only, false for non-favorites. Omit for both."),
+			"type":        strProp("IMAGE or VIDEO. Omit for both."),
+			"size":        intProp("Results per page 1-100", 1, 100),
+			"page":        intProp("Page number from 1", 1, 1000000),
+		}, nil),
+	},
+	{
+		Name:        "recent_photos",
+		Description: "Latest library photos first, optionally scoped to one person id or name. Returns projected asset rows with ids for show_photo.",
+		InputSchema: objSchema(map[string]any{
+			"person": strProp("Person UUID or name. Omit for the whole library."),
+			"size":   intProp("How many 1-100", 1, 100),
+		}, nil),
+	},
+	{
+		Name:        "favorite_photo",
+		Description: "Favorite or unfavorite one asset by id. Reversible.",
+		InputSchema: objSchema(map[string]any{
+			"assetId":  strProp("Asset UUID"),
+			"favorite": boolProp("True to favorite (default), false to unfavorite."),
+		}, []string{"assetId"}),
+	},
+	{
+		Name:        "name_person",
+		Description: "Name a face: pass a person id from search_people (also accepts the current name). Use for the 19 unnamed faces.",
+		InputSchema: objSchema(map[string]any{
+			"person": strProp("Person UUID"),
+			"name":   strProp("Full name to assign"),
+		}, []string{"person", "name"}),
+	},
+	{
+		Name:        "random_memory",
+		Description: "Draw one random photo as a memory lane moment, optionally from one person's photos. Returns the asset row; call show_photo to display it.",
+		InputSchema: objSchema(map[string]any{
+			"person": strProp("Person UUID or name. Omit for the whole library."),
+		}, nil),
+	},
+	{
+		Name:        "album_build",
+		Description: "Create an album and fill it in one step. Gather asset ids from person_photos, photo_search or search_photos first, then pass them here.",
+		InputSchema: objSchema(map[string]any{
+			"name":     strProp("Album title"),
+			"assetIds": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Up to 200 asset UUIDs"},
+		}, []string{"name", "assetIds"}),
+	},
+	{
 		Name:        "server_stats",
 		Description: "Library-wide usage statistics (photos, videos, storage by user). Requires an admin API key.",
 		InputSchema: objSchema(map[string]any{}, nil),
@@ -225,14 +279,20 @@ var tools = []toolDef{
 }
 
 var handlers = map[string]handler{
-	"search_photos": hSearchPhotos,
-	"list_albums":   hListAlbums,
-	"album_assets":  hAlbumAssets,
-	"asset_info":    hAssetInfo,
-	"server_stats":  hServerStats,
-	"show_photo":    hShowPhoto,
-	"search_people": hSearchPeople,
-	"person_photos": hPersonPhotos,
+	"search_photos":  hSearchPhotos,
+	"list_albums":    hListAlbums,
+	"album_assets":   hAlbumAssets,
+	"asset_info":     hAssetInfo,
+	"server_stats":   hServerStats,
+	"show_photo":     hShowPhoto,
+	"photo_search":   hPhotoSearch,
+	"recent_photos":  hRecentPhotos,
+	"favorite_photo": hFavoritePhoto,
+	"name_person":    hNamePerson,
+	"random_memory":  hRandomMemory,
+	"album_build":    hAlbumBuild,
+	"search_people":  hSearchPeople,
+	"person_photos":  hPersonPhotos,
 }
 
 func strArg(args map[string]any, key string) string {
@@ -584,6 +644,281 @@ func hShowPhoto(args map[string]any) map[string]any {
 		map[string]any{"type": "text", "text": "Photo " + id + " (" + size + ", " + ctype + ", " + strconv.Itoa(len(body)) + " bytes)"},
 		map[string]any{"type": "image", "data": base64.StdEncoding.EncodeToString(body), "mimeType": ctype},
 	}}
+}
+
+func apiPut(path string, payload any) (int, []byte, error) {
+	buf, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequest(http.MethodPut, baseURL+path, bytes.NewReader(buf))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// normDateTime accepts a bare date (2026-04-01, assumed UTC midnight)
+// or a full datetime and returns the full form Immich validates.
+func normDateTime(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if len(v) == len("2006-01-02") {
+		return v + "T00:00:00Z"
+	}
+	return v
+}
+
+func boolArg(args map[string]any, key string, def bool) bool {
+	if v, present := args[key].(bool); present {
+		return v
+	}
+	return def
+}
+
+func hPhotoSearch(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	payload := map[string]any{}
+	if ref := strings.TrimSpace(strArg(args, "person")); ref != "" {
+		id, _, errMap := resolvePerson(ref)
+		if errMap != nil {
+			return errMap
+		}
+		payload["personIds"] = []string{id}
+	}
+	if v := normDateTime(strArg(args, "takenAfter")); v != "" {
+		payload["takenAfter"] = v
+	}
+	if v := normDateTime(strArg(args, "takenBefore")); v != "" {
+		payload["takenBefore"] = v
+	}
+	if _, present := args["isFavorite"]; present {
+		payload["isFavorite"] = boolArg(args, "isFavorite", false)
+	}
+	if v := strings.ToUpper(strings.TrimSpace(strArg(args, "type"))); v == "IMAGE" || v == "VIDEO" {
+		payload["type"] = v
+	}
+	size := intArg(args, "size", 20)
+	if size < 1 {
+		size = 1
+	}
+	if size > 100 {
+		size = 100
+	}
+	payload["size"] = size
+	if page := intArg(args, "page", 1); page > 1 {
+		payload["page"] = page
+	}
+	status, body, err := apiPost("/api/search/metadata", payload)
+	if err != nil {
+		return errText("photo search failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	return okText(projectPersonAssets(body))
+}
+
+func hRecentPhotos(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	payload := map[string]any{}
+	if ref := strings.TrimSpace(strArg(args, "person")); ref != "" {
+		id, _, errMap := resolvePerson(ref)
+		if errMap != nil {
+			return errMap
+		}
+		payload["personIds"] = []string{id}
+	}
+	size := intArg(args, "size", 20)
+	if size < 1 {
+		size = 1
+	}
+	if size > 100 {
+		size = 100
+	}
+	payload["size"] = size
+	status, body, err := apiPost("/api/search/metadata", payload)
+	if err != nil {
+		return errText("recent lookup failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	return okText(projectPersonAssets(body))
+}
+
+func hFavoritePhoto(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	id := strArg(args, "assetId")
+	if id == "" {
+		return errText("assetId is required")
+	}
+	fav := boolArg(args, "favorite", true)
+	status, body, err := apiPut("/api/assets/"+url.PathEscape(id), map[string]any{"isFavorite": fav})
+	if err != nil {
+		return errText("favorite update failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	verb := "favorited"
+	if !fav {
+		verb = "unfavorited"
+	}
+	buf, _ := json.Marshal(map[string]any{"assetId": id, "result": verb})
+	return okText(buf)
+}
+
+func hNamePerson(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	id, _, errMap := resolvePerson(strArg(args, "person"))
+	if errMap != nil {
+		return errMap
+	}
+	name := strings.TrimSpace(strArg(args, "name"))
+	if name == "" {
+		return errText("name is required and cannot be blank")
+	}
+	status, body, err := apiPut("/api/people/"+url.PathEscape(id), map[string]any{"name": name})
+	if err != nil {
+		return errText("rename failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	buf, _ := json.Marshal(map[string]any{"personId": id, "name": name})
+	return okText(buf)
+}
+
+func hRandomMemory(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	payload := map[string]any{"size": 100}
+	if ref := strings.TrimSpace(strArg(args, "person")); ref != "" {
+		id, _, errMap := resolvePerson(ref)
+		if errMap != nil {
+			return errMap
+		}
+		payload["personIds"] = []string{id}
+	}
+	status, body, err := apiPost("/api/search/metadata", payload)
+	if err != nil {
+		return errText("memory draw failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	var envelope struct {
+		Assets struct {
+			Items []map[string]any `json:"items"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil || len(envelope.Assets.Items) == 0 {
+		return errText("no photos to draw from")
+	}
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return errText("random draw failed: %v", err)
+	}
+	pick := envelope.Assets.Items[int(binary.LittleEndian.Uint64(seed[:])%uint64(len(envelope.Assets.Items)))]
+	keep := []string{"id", "originalFileName", "type", "localDateTime", "fileCreatedAt", "width", "height", "isFavorite"}
+	row := map[string]any{}
+	for _, k := range keep {
+		if v, present := pick[k]; present {
+			row[k] = v
+		}
+	}
+	row["poolSize"] = len(envelope.Assets.Items)
+	buf, _ := json.Marshal(row)
+	return okText(buf)
+}
+
+func hAlbumBuild(args map[string]any) map[string]any {
+	if e := requireKey(); e != nil {
+		return e
+	}
+	name := strings.TrimSpace(strArg(args, "name"))
+	if name == "" {
+		return errText("name is required")
+	}
+	var ids []string
+	for _, raw := range toStringSlice(args["assetIds"]) {
+		if v := strings.TrimSpace(raw); v != "" {
+			ids = append(ids, v)
+		}
+	}
+	if len(ids) == 0 {
+		return errText("assetIds is required: gather ids from person_photos, photo_search or search_photos first")
+	}
+	if len(ids) > 200 {
+		return errText("at most 200 assets per album build, got %d", len(ids))
+	}
+	status, body, err := apiPost("/api/albums", map[string]any{"albumName": name})
+	if err != nil {
+		return errText("album create failed: %v", err)
+	}
+	if status >= 400 {
+		return errText("Immich HTTP %d: %s", status, clip(string(body)))
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil || created.ID == "" {
+		return errText("album create returned no id")
+	}
+	status, body, err = apiPut("/api/albums/"+url.PathEscape(created.ID)+"/assets", map[string]any{"ids": ids})
+	if err != nil {
+		return errText("album fill failed (album %s exists): %v", created.ID, err)
+	}
+	if status >= 400 {
+		return errText("album fill HTTP %d (album %s exists): %s", status, created.ID, clip(string(body)))
+	}
+	buf, _ := json.Marshal(map[string]any{"albumId": created.ID, "name": name, "assetsAdded": len(ids)})
+	return okText(buf)
+}
+
+func toStringSlice(v any) []string {
+	switch t := v.(type) {
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return t
+	case string:
+		if t == "" {
+			return nil
+		}
+		return []string{t}
+	}
+	return nil
 }
 
 // ---------- schema helpers ----------

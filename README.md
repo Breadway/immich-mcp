@@ -17,7 +17,7 @@ go build -o immich-mcp .
 ## Tools
 
 `search_photos`, `list_albums`, `album_assets`, `asset_info`,
-`search_people`, `person_photos`, `server_stats` (admin key needed for stats), `show_photo`.
+`search_people`, `person_photos`, `server_stats` (admin key needed for stats), `show_photo`, `photo_search`, `recent_photos`, `favorite_photo`, `name_person`, `random_memory`, `album_build`.
 
 `search_people` matches facial-recognition names (exact, then unique
 substring); `person_photos` takes a person id or full name plus `size`/`page`
